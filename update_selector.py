@@ -2,6 +2,7 @@ import os
 from datetime import datetime
 import time
 import numpy as np
+import math
 import random
 import argparse
 from shutil import copyfile
@@ -11,8 +12,8 @@ import torch.optim as optim
 from torch.autograd import Variable
 from torchtext import data
 
-from model.predictor import Predictor
-from model.trainer_predictor import PredictorTrainer
+from model.selector import Selector
+from model.trainer_selector import SelectorTrainer
 from utils import scorer, helper
 
 parser = argparse.ArgumentParser()
@@ -22,7 +23,7 @@ parser.add_argument('--emb_dim', type=int, default=300, help='Word embedding dim
 parser.add_argument('--ner_dim', type=int, default=30, help='NER embedding dimension.')
 parser.add_argument('--pos_dim', type=int, default=30, help='POS embedding dimension.')
 parser.add_argument('--hidden_dim', type=int, default=200, help='RNN hidden state size.')
-parser.add_argument('--num_layers', type=int, default=2, help='Num of RNN layers.')
+parser.add_argument('--num_layers', type=int, default=1, help='Num of RNN layers.')
 parser.add_argument('--dropout', type=float, default=0.5, help='Input and RNN dropout rate.')
 
 parser.add_argument('--attn', dest='attn', action='store_true', help='Use attention layer.')
@@ -70,7 +71,8 @@ PST = data.Field(sequential=True, batch_first=True)
 
 fields = {'tokens':('token', TOKEN), 'stanford_pos':('pos', POS), 'stanford_ner':('ner', NER), 'relation':('relation', RELATION), 'subj_pst':('subj_pst', PST), 'obj_pst':('obj_pst', PST)}
 dataset_vocab = data.TabularDataset(path=opt['data_dir'] + '/train.json', format='json', fields=fields)
-dataset_train = data.TabularDataset(path=opt['data_dir'] + '/' + opt['dataset'], format='json', fields=fields)
+dataset_train = data.TabularDataset(path=opt['data_dir'] + '/labeled.json', format='json', fields=fields)
+dataset_infer = data.TabularDataset(path=opt['data_dir'] + '/' + opt['dataset'], format='json', fields=fields)
 dataset_dev = data.TabularDataset(path=opt['data_dir'] + '/dev.json', format='json', fields=fields)
 
 TOKEN.build_vocab(dataset_vocab)
@@ -78,6 +80,8 @@ RELATION.build_vocab(dataset_vocab)
 POS.build_vocab(dataset_vocab)
 NER.build_vocab(dataset_vocab)
 PST.build_vocab(dataset_vocab)
+
+dataset_train.examples = dataset_train.examples + dataset_infer.examples
 
 iterator_train = data.Iterator(dataset=dataset_train, batch_size=opt['batch_size'], device=-1, repeat=False, train=True, shuffle=True, sort_key=lambda x: len(x.token), sort_within_batch=True)
 iterator_dev = data.Iterator(dataset=dataset_dev, batch_size=opt['batch_size'], device=-1, repeat=False, train=True, sort_key=lambda x: len(x.token), sort_within_batch=True)
@@ -91,8 +95,6 @@ opt['vocab_size'] = len(TOKEN.vocab)
 opt['pos_size'] = len(POS.vocab)
 opt['ner_size'] = len(NER.vocab)
 opt['pe_size'] = len(PST.vocab)
-
-opt['kernels'] = [3, 4, 5]
 
 TOKEN.vocab.load_vectors('glove.840B.300d')
 if TOKEN.vocab.vectors is not None:
@@ -113,20 +115,76 @@ file_logger = helper.FileLogger(model_save_dir + '/' + opt['log'], header="# epo
 helper.print_config(opt)
 
 # model
-predictor = Predictor(opt, emb_matrix=TOKEN.vocab.vectors)
-model = PredictorTrainer(opt, predictor)
+selector = Selector(opt, emb_matrix=TOKEN.vocab.vectors)
+model = SelectorTrainer(opt, selector)
 
-dev_f1_history = []
+def AUC(logits, labels):
+    num_right = sum(labels)
+    num_total = len(labels)
+    num_total_pairs = (num_total - num_right) * num_right;
+
+    if num_total_pairs == 0:
+        return 0.5
+
+    num_right_pairs = 0
+    hit_count = 0
+    for label in labels:
+        if label == 0:
+            num_right_pairs += hit_count
+        else:
+            hit_count += 1
+
+    return float(num_right_pairs) / num_total_pairs
+
+def evaluate():
+    logits, labels = [], []
+    for batch in iterator_dev:
+        inputs = {}
+        inputs['words'], inputs['length'] = batch.token
+        inputs['pos'] = batch.pos
+        inputs['ner'] = batch.ner
+        inputs['subj_pst'] = batch.subj_pst
+        inputs['obj_pst'] = batch.obj_pst
+        inputs['masks'] = torch.eq(batch.token[0], opt['vocab_pad_id'])
+        
+        logit = model.predict(inputs).data.cpu().numpy().tolist()
+        label = batch.relation.data.numpy().tolist()
+
+        logits += logit
+        labels += label
+
+    p, q = 0, 0
+    for rel in range(len(RELATION.vocab)):
+        if rel == RELATION.vocab.stoi['no_relation']:
+            continue
+
+        logits_rel = [logit[rel] for logit in logits]
+        labels_rel = [1 if label == rel else 0 for label in labels]
+
+        ranking = list(zip(logits_rel, labels_rel))
+        ranking = sorted(ranking, key=lambda x:x[0], reverse=True)
+
+        logits_rel, labels_rel = zip(*ranking)
+
+        p += AUC(logits_rel, labels_rel)
+        q += 1
+
+    return p / q * 100
+
+dev_auc_history = []
 current_lr = opt['lr']
 
 global_step = 0
 global_start_time = time.time()
-format_str = '{}: step {}/{} (epoch {}/{}), loss = {:.6f} ({:.3f} sec/batch), lr: {:.6f}'
+format_str = '{}: step {}/{} (epoch {}/{}), loss = {:.6f}, ({:.3f} sec/batch), lr: {:.6f}'
 max_steps = len(iterator_train) * opt['num_epoch']
 
+batches = [batch for batch in iterator_train]
 # start training
 for epoch in range(1, opt['num_epoch']+1):
     train_loss = 0
+
+    random.shuffle(batches)
     for i, batch in enumerate(iterator_train):
         start_time = time.time()
         global_step += 1
@@ -150,39 +208,17 @@ for epoch in range(1, opt['num_epoch']+1):
 
     # eval on dev
     print("Evaluating on dev set...")
-    predictions = []
-    golds = []
-    dev_loss = 0
-    for i, batch in enumerate(iterator_dev):
-        inputs = {}
-        inputs['words'], inputs['length'] = batch.token
-        inputs['pos'] = batch.pos
-        inputs['ner'] = batch.ner
-        inputs['subj_pst'] = batch.subj_pst
-        inputs['obj_pst'] = batch.obj_pst
-        inputs['masks'] = torch.eq(batch.token[0], opt['vocab_pad_id'])
-
-        target = batch.relation
-
-        preds, _, loss = model.predict(inputs, target)
-        predictions += preds
-        dev_loss += loss
-        golds += target.data.tolist()
-    predictions = [RELATION.vocab.itos[p] for p in predictions]
-    golds = [RELATION.vocab.itos[p] for p in golds]
-    dev_p, dev_r, dev_f1 = scorer.score(golds, predictions)
+    dev_auc = evaluate()
     
     # print training information
     train_loss = train_loss / len(iterator_train) * opt['batch_size'] # avg loss per batch
-    dev_loss = dev_loss / len(iterator_dev) * opt['batch_size']
-    print("epoch {}: train_loss = {:.6f}, dev_loss = {:.6f}, dev_f1 = {:.4f}".format(epoch,\
-            train_loss, dev_loss, dev_f1))
-    file_logger.log("{}\t{:.6f}\t{:.6f}\t{:.4f}".format(epoch, train_loss, dev_loss, dev_f1))
+    print("epoch {}: train_loss = {:.6f}, dev_auc = {:.4f}".format(epoch, train_loss, dev_auc))
+    file_logger.log("{}\t{:.6f}\t{:.4f}".format(epoch, train_loss, dev_auc))
 
     # save the current model
     model_file = model_save_dir + '/checkpoint_epoch_{}.pt'.format(epoch)
     model.save(model_file, epoch)
-    if epoch == 1 or dev_f1 > max(dev_f1_history):
+    if epoch == 1 or dev_auc > max(dev_auc_history):
         copyfile(model_file, model_save_dir + '/best_model.pt')
         print("new best model saved.")
     if epoch % opt['save_epoch'] != 0:
@@ -190,12 +226,11 @@ for epoch in range(1, opt['num_epoch']+1):
     
     # lr schedule
     # change learning rate
-    if len(dev_f1_history) > 10 and dev_f1 <= dev_f1_history[-1] and \
-            opt['optim'] in ['sgd', 'adagrad']:
+    if len(dev_auc_history) > 1 and dev_auc <= dev_auc_history[-1] and dev_auc_history[-1] <= dev_auc_history[-2] and opt['optim'] in ['sgd', 'adagrad']: 
         current_lr *= opt['lr_decay']
         model.update_lr(current_lr)
 
-    dev_f1_history += [dev_f1]
+    dev_auc_history += [dev_auc]
     print("")
 
 print("Training ended with {} epochs.".format(epoch))

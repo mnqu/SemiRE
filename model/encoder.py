@@ -1,3 +1,6 @@
+"""
+A rnn model for relation extraction, written in pytorch.
+"""
 import math
 import numpy as np
 import torch

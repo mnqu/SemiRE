@@ -22,6 +22,7 @@ parser.add_argument('--p_model', type=str, default='best_model.pt', help='Name o
 parser.add_argument('--s_model', type=str, default='best_model.pt', help='Name of the model file.')
 parser.add_argument('--data_dir', type=str, default='dataset/tacred')
 #parser.add_argument('--dataset', type=str, default='unlabeled', help="Evaluate on dev or test.")
+parser.add_argument('--mode', type=str, default='p', help="Sampling mode")
 parser.add_argument('--out', type=str, default='', help="Save model predictions to this dir.")
 parser.add_argument('--num', type=int, default=1000)
 
@@ -48,7 +49,7 @@ model_p.load(model_p_file)
 model_s_file = args.s_dir + '/' + args.s_model
 print("Loading selector from {}".format(model_s_file))
 opt_s = torch_utils.load_config(model_s_file)
-selector = Selector(opt_s)
+selector = Predictor(opt_s)
 model_s = SelectorTrainer(opt_s, selector)
 model_s.load(model_s_file)
 
@@ -98,7 +99,7 @@ for i, batch in enumerate(iterator_unlabeled):
     preds_p += pred
 
     selector.eval()
-    pred = torch.sigmoid(selector.predict(inputs))
+    pred = selector.predict(inputs)
     pred = pred.data.cpu().numpy().tolist()
     preds_s += pred
 
@@ -112,38 +113,64 @@ def arg_max(l):
 
 examples = iterator_unlabeled.data()
 num_instance = len(examples)
-nolid = RELATION.vocab.stoi['no_relation']
 
-ranking_p = {}
-for eid in range(num_instance):
-    for rel in range(len(RELATION.vocab)):
-        if rel == nolid:
-            continue
-        ranking_p[(eid, rel)] = preds_p[eid][rel]
+ranking = list(zip(range(num_instance), preds_p))
+ranking = sorted(ranking, key=lambda x:arg_max(x[1])[1], reverse=True)
 
-ranking_s = {}
-for eid in range(num_instance):
-    for rel in range(len(RELATION.vocab)):
-        if rel == nolid:
-            continue
-        ranking_s[(eid, rel)] = preds_s[eid][rel]
+rel2cn = {}
+data_p = []
+p, q = 0, 0
+for eid, pred in ranking:
+    rel, val = arg_max(pred)
+    if rel == nolid:
+        continue
+    data_p += [(eid, rel, val)]
+    rel2cn[rel] = rel2cn.get(rel, 0) + 1
 
-ranking_p = sorted(ranking_p.items(), key=lambda x:x[1], reverse=True)
-ranking_s = sorted(ranking_s.items(), key=lambda x:x[1], reverse=True)
+    example = examples[eid]
+    if RELATION.vocab.itos[rel] == example.relation:
+        p += 1
+    q += 1
 
-data = set()
-for k in range(args.num):
-    (eid, rel), val = ranking_p[k]
-    data.add((eid, rel))
+    if q == args.num:
+        break
 
-    (eid, rel), val = ranking_s[k]
-    data.add((eid, rel))
+print('P: {} {} {:.2f}'.format(p, q, p * 100 / q))
+
+data_s = []
+p, q = 0, 0
+for rel in range(len(RELATION.vocab)):
+    if rel == nolid:
+        continue
+
+    ranking = list(zip(range(num_instance), [preds_s[k][rel] for k in range(num_instance)]))
+    ranking = sorted(ranking, key=lambda x:x[1], reverse=True)
+
+    cn = rel2cn.get(rel, 0)
+
+    for k in range(cn):
+        eid, val = ranking[k][0], ranking[k][1]
+        data_s += [(eid, rel, val)]
+
+        example = examples[eid]
+        if RELATION.vocab.itos[rel] == example.relation:
+            p += 1
+        q += 1
+
+print('S: {} {} {:.2f}'.format(p, q, p * 100 / q))
+
+data = {}
+for eid, rel, val in data_p + data_s:
+    data[(eid, rel)] = data.get((eid, rel), 0) + 1
 
 p, q = 0, 0
 fo = open(args.out, 'w')
-for eid, rel in data:
+for (eid, rel), val in data.items():
+    if val != 2:
+        continue
+
     example = examples[eid]
-    if rel == RELATION.vocab.stoi[example.relation]:
+    if RELATION.vocab.itos[rel] == example.relation:
         p += 1
     q += 1
 
@@ -155,6 +182,7 @@ for eid, rel in data:
     output['obj_pst'] = example.obj_pst
     output['relation'] = RELATION.vocab.itos[rel]
     fo.write(json.dumps(output) + '\n')
-fo.close()
 
-print('A: {} {} {:.2f}'.format(p, q, p * 100 / q))
+print('{} {} {:.2f}'.format(p, q, p * 100 / q))
+print("Inference ended.")
+
